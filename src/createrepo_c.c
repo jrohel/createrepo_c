@@ -125,7 +125,8 @@ fill_pool(GThreadPool *pool,
           GSList **current_pkglist,
           FILE *output_pkg_list,
           long *package_count,
-          int  media_id)
+          int  media_id,
+          GQueue *out_modules_queue)
 {
     GQueue queue = G_QUEUE_INIT;
     struct PoolTask *task;
@@ -167,8 +168,15 @@ fill_pool(GThreadPool *pool,
 
                 gchar *full_path = g_strconcat(dirname, "/", filename, NULL);
 
-                // Non .rpm files
-                if (!g_str_has_suffix (filename, ".rpm")) {
+                enum {RPM_FILE, MODULE_FILE, UNKNOWN_FILE} file_type;
+                if (g_str_has_suffix(filename, ".rpm"))
+                    file_type = RPM_FILE;
+                else if (g_str_has_suffix(filename, ".yaml"))
+                    file_type = MODULE_FILE;
+                else
+                    file_type = UNKNOWN_FILE;
+                    
+                if (file_type == UNKNOWN_FILE) {
                     if (g_file_test(full_path, G_FILE_TEST_IS_DIR)) {
                         // Directory
                         gchar *sub_dir_in_chunk;
@@ -206,8 +214,11 @@ fill_pool(GThreadPool *pool,
                     if (output_pkg_list)
                         fprintf(output_pkg_list, "%s\n", repo_relative_path);
                     *current_pkglist = g_slist_prepend(*current_pkglist, task->filename);
-                    // TODO: One common path for all tasks with the same path?
-                    g_queue_insert_sorted(&queue, task, task_cmp, NULL);
+                    if (file_type == MODULE_FILE)
+                        g_queue_insert_sorted(out_modules_queue, task, task_cmp, NULL);
+                    else
+                        // TODO: One common path for all tasks with the same path?
+                        g_queue_insert_sorted(&queue, task, task_cmp, NULL);
                 } else {
                     g_free(full_path);
                 }
@@ -252,7 +263,10 @@ fill_pool(GThreadPool *pool,
                 if (output_pkg_list)
                     fprintf(output_pkg_list, "%s\n", relative_path);
                 *current_pkglist = g_slist_prepend(*current_pkglist, task->filename);
-                g_queue_insert_sorted(&queue, task, task_cmp, NULL);
+                if (g_str_has_suffix(filename, ".yaml"))
+                    g_queue_insert_sorted(out_modules_queue, task, task_cmp, NULL);
+                else
+                    g_queue_insert_sorted(&queue, task, task_cmp, NULL);
             }
         }
     }
@@ -481,6 +495,7 @@ main(int argc, char **argv)
     long package_count = 0;
     GSList *current_pkglist = NULL;
     /* ^^^ List with basenames of files which will be processed */
+    GQueue out_modules_queue = G_QUEUE_INIT;
 
     for (int media_id = 1; media_id < argc; media_id++ ) {
         gchar *tmp_in_dir = cr_normalize_dir_path(argv[media_id]);
@@ -491,7 +506,8 @@ main(int argc, char **argv)
                   &current_pkglist,
                   output_pkg_list,
                   &package_count,
-                  media_id);
+                  media_id,
+                  &out_modules_queue);
         g_free(tmp_in_dir);
     }
 
@@ -631,9 +647,11 @@ main(int argc, char **argv)
 
     // Setup compression types
     const char *xml_compression_suffix = NULL;
+    const char *yaml_compression_suffix = NULL;
     const char *sqlite_compression_suffix = NULL;
     const char *prestodelta_compression_suffix = NULL;
     cr_CompressionType xml_compression = CR_CW_GZ_COMPRESSION;
+    cr_CompressionType yaml_compression = CR_CW_GZ_COMPRESSION;
     cr_CompressionType sqlite_compression = CR_CW_BZ2_COMPRESSION;
     cr_CompressionType groupfile_compression = CR_CW_GZ_COMPRESSION;
     cr_CompressionType prestodelta_compression = CR_CW_GZ_COMPRESSION;
@@ -658,6 +676,7 @@ main(int argc, char **argv)
     }
 
     xml_compression_suffix = cr_compression_suffix(xml_compression);
+    yaml_compression_suffix = cr_compression_suffix(yaml_compression);
     sqlite_compression_suffix = cr_compression_suffix(sqlite_compression);
     prestodelta_compression_suffix = cr_compression_suffix(prestodelta_compression);
 
@@ -738,6 +757,76 @@ main(int argc, char **argv)
         cr_xmlfile_close(pri_cr_file, NULL);
         exit(EXIT_FAILURE);
     }
+
+    // Write modules.yaml compressed file
+    gchar *mod_yaml_filename = NULL;
+    cr_ContentStat *mod_yaml_stat = NULL;
+
+    struct PoolTask *task;
+    if (!g_queue_is_empty(&out_modules_queue)) {
+
+        CR_FILE *mod_yaml_cr_file;
+
+        mod_yaml_filename = g_strconcat(tmp_out_repo, "/modules.yaml", yaml_compression_suffix, NULL);
+        mod_yaml_stat = cr_contentstat_new(cmd_options->repomd_checksum_type, NULL);
+        mod_yaml_cr_file = cr_sopen(mod_yaml_filename,
+                                    CR_CW_MODE_WRITE,
+                                    yaml_compression,
+                                    mod_yaml_stat,
+                                    &tmp_err);
+        assert(mod_yaml_cr_file || tmp_err);
+        if (!mod_yaml_cr_file) {
+            g_critical("Cannot open file %s: %s",
+                      mod_yaml_filename, tmp_err->message);
+            g_clear_error(&tmp_err);
+            cr_contentstat_free(mod_yaml_stat, NULL);
+            cr_contentstat_free(pri_stat, NULL);
+            cr_contentstat_free(fil_stat, NULL);
+            cr_contentstat_free(oth_stat, NULL);
+            g_free(mod_yaml_filename);
+            g_free(pri_xml_filename);
+            g_free(fil_xml_filename);
+            g_free(oth_xml_filename);
+            cr_xmlfile_close(fil_cr_file, NULL);
+            cr_xmlfile_close(pri_cr_file, NULL);
+            cr_xmlfile_close(oth_cr_file, NULL);
+            exit(EXIT_FAILURE);
+        }
+        
+        const char *header = "---\n";
+        while ((task = g_queue_pop_head(&out_modules_queue)) != NULL) {
+            FILE *fmodule = fopen(task->full_path, "r");
+            if (!fmodule) {
+                g_critical("Cannot open %s: %s", task->full_path, g_strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            
+            // Write header
+            cr_write(mod_yaml_cr_file, header, strlen(header), &tmp_err);
+
+            // Copy content of module yaml file
+            char buf[1024];
+            size_t readed;
+            char last_char = '\n';
+            while ((readed = fread(buf, 1, sizeof(buf), fmodule)) > 0) {
+                last_char = buf[readed-1];
+                cr_write(mod_yaml_cr_file, buf, readed, &tmp_err);
+            }
+            
+            // Will add new line to the end, if is missing in source yaml 
+            if (last_char != '\n')
+                cr_write(mod_yaml_cr_file, "\n", 1, &tmp_err);
+
+            fclose(fmodule);
+        }
+        
+        cr_close(mod_yaml_cr_file, &tmp_err);
+        if (tmp_err) {
+            g_critical("Cannot close file %s: %s",
+                       mod_yaml_filename, tmp_err->message);
+            exit(EXIT_FAILURE);
+        }
+    }   
 
     // Set number of packages
     g_debug("Setting number of packages");
@@ -894,6 +983,7 @@ main(int argc, char **argv)
     cr_RepomdRecord *pri_xml_rec = cr_repomd_record_new("primary", pri_xml_filename);
     cr_RepomdRecord *fil_xml_rec = cr_repomd_record_new("filelists", fil_xml_filename);
     cr_RepomdRecord *oth_xml_rec = cr_repomd_record_new("other", oth_xml_filename);
+    cr_RepomdRecord *mod_yaml_rec             = NULL;
     cr_RepomdRecord *pri_db_rec               = NULL;
     cr_RepomdRecord *fil_db_rec               = NULL;
     cr_RepomdRecord *oth_db_rec               = NULL;
@@ -950,6 +1040,21 @@ main(int argc, char **argv)
         }
     }
 
+    // Modules
+    if (mod_yaml_filename) {
+        mod_yaml_rec = cr_repomd_record_new("modules", mod_yaml_filename);
+        cr_repomd_record_load_contentstat(mod_yaml_rec, mod_yaml_stat);
+        cr_contentstat_free(mod_yaml_stat, NULL);
+        cr_repomd_record_fill(mod_yaml_rec,
+                              cmd_options->repomd_checksum_type,
+                              &tmp_err);
+        if (tmp_err) {
+            g_critical("Cannot process modules %s: %s",
+                       mod_yaml_filename, tmp_err->message);
+            g_clear_error(&tmp_err);
+            exit(EXIT_FAILURE);
+        }
+    }
 
     // Updateinfo
     if (updateinfo) {
@@ -1181,6 +1286,7 @@ deltaerror:
         cr_repomd_record_rename_file(pri_xml_rec, NULL);
         cr_repomd_record_rename_file(fil_xml_rec, NULL);
         cr_repomd_record_rename_file(oth_xml_rec, NULL);
+        if (mod_yaml_rec) cr_repomd_record_rename_file(mod_yaml_rec, NULL);
         cr_repomd_record_rename_file(pri_db_rec, NULL);
         cr_repomd_record_rename_file(fil_db_rec, NULL);
         cr_repomd_record_rename_file(oth_db_rec, NULL);
@@ -1194,6 +1300,7 @@ deltaerror:
     cr_repomd_set_record(repomd_obj, pri_xml_rec);
     cr_repomd_set_record(repomd_obj, fil_xml_rec);
     cr_repomd_set_record(repomd_obj, oth_xml_rec);
+    cr_repomd_set_record(repomd_obj, mod_yaml_rec);
     cr_repomd_set_record(repomd_obj, pri_db_rec);
     cr_repomd_set_record(repomd_obj, fil_db_rec);
     cr_repomd_set_record(repomd_obj, oth_db_rec);
@@ -1344,6 +1451,7 @@ deltaerror:
     g_free(pri_xml_filename);
     g_free(fil_xml_filename);
     g_free(oth_xml_filename);
+    g_free(mod_yaml_filename);
     g_free(pri_db_filename);
     g_free(fil_db_filename);
     g_free(oth_db_filename);
